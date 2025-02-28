@@ -1,0 +1,97 @@
+=== Performance Comparison Results: 4_feature_detection.trt (20250228_085226) ===
+
++-------------------------------+----------------+----------------+----------------+
+| Configuration                 | Average Time   | Minimum Time   | Maximum Time   |
++===============================+================+================+================+
+| Basic                         | 8.11ms         | 7.80ms         | 9.49ms         |
++-------------------------------+----------------+----------------+----------------+
+| Stream                        | 8.22ms         | 7.97ms         | 8.63ms         |
++-------------------------------+----------------+----------------+----------------+
+| Memory Pool                   | 8.24ms         | 8.01ms         | 8.79ms         |
++-------------------------------+----------------+----------------+----------------+
+| Memory Pool + Stream          | 8.18ms         | 7.97ms         | 8.69ms         |
++-------------------------------+----------------+----------------+----------------+
+| Warmup + Memory Pool + Stream | 8.07ms         | 7.97ms         | 8.21ms         |
++-------------------------------+----------------+----------------+----------------+
+
+=== Detailed Results ===
+
+[Basic]
+Average Time: 8.11ms
+Minimum Time: 7.80ms
+Maximum Time: 9.49ms
+Individual Run Times:
+  Run 1: 9.49ms
+  Run 2: 8.10ms
+  Run 3: 7.96ms
+  Run 4: 7.80ms
+  Run 5: 7.91ms
+  Run 6: 7.94ms
+  Run 7: 7.99ms
+  Run 8: 7.87ms
+  Run 9: 8.06ms
+  Run 10: 7.99ms
+
+[Stream]
+Average Time: 8.22ms
+Minimum Time: 7.97ms
+Maximum Time: 8.63ms
+Individual Run Times:
+  Run 1: 8.63ms
+  Run 2: 8.23ms
+  Run 3: 8.10ms
+  Run 4: 8.29ms
+  Run 5: 8.07ms
+  Run 6: 7.97ms
+  Run 7: 8.51ms
+  Run 8: 8.16ms
+  Run 9: 8.15ms
+  Run 10: 8.12ms
+
+[Memory Pool]
+Average Time: 8.24ms
+Minimum Time: 8.01ms
+Maximum Time: 8.79ms
+Individual Run Times:
+  Run 1: 8.79ms
+  Run 2: 8.19ms
+  Run 3: 8.33ms
+  Run 4: 8.37ms
+  Run 5: 8.27ms
+  Run 6: 8.14ms
+  Run 7: 8.07ms
+  Run 8: 8.04ms
+  Run 9: 8.01ms
+  Run 10: 8.14ms
+
+[Memory Pool + Stream]
+Average Time: 8.18ms
+Minimum Time: 7.97ms
+Maximum Time: 8.69ms
+Individual Run Times:
+  Run 1: 8.69ms
+  Run 2: 8.36ms
+  Run 3: 8.06ms
+  Run 4: 8.02ms
+  Run 5: 8.01ms
+  Run 6: 7.97ms
+  Run 7: 8.14ms
+  Run 8: 8.27ms
+  Run 9: 8.12ms
+  Run 10: 8.20ms
+
+[Warmup + Memory Pool + Stream]
+Average Time: 8.07ms
+Minimum Time: 7.97ms
+Maximum Time: 8.21ms
+Individual Run Times:
+  Run 1: 8.03ms
+  Run 2: 7.97ms
+  Run 3: 8.11ms
+  Run 4: 8.10ms
+  Run 5: 8.21ms
+  Run 6: 7.98ms
+  Run 7: 8.09ms
+  Run 8: 7.97ms
+  Run 9: 8.08ms
+  Run 10: 8.15ms
