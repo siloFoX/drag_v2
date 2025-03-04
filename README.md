@@ -1,6 +1,33 @@
 # Detection and Reading of Analog and digital Gauges (DRAG) ver 2 by silofox
 
-- 2025-02-28 start development for refactoring codes and serving real time in DRAG
+- 2025-02-28 Start development for refactoring codes and serving real time in DRAG
+- 2025-03-04 Refactoring DRAG and make safe in multi models
+
+```
+주요 업데이트
+1. 안정성 및 오류 처리 개선
+
+SafeTRTServerWrapper 클래스를 통한 더 안전한 TensorRT 엔진 관리
+모든 작업에 대한 포괄적인 예외 처리 및 로깅
+비동기 작업 처리 중 안전한 리소스 해제 메커니즘
+
+2. 성능 지표 수집 및 모니터링
+
+MetricsCollector 클래스를 통한 추론 성능 데이터 수집
+평균, 최소, 최대 추론 시간, 처리량 등 실시간 모니터링
+주기적인 성능 통계 로깅 및 분석
+
+3. 다중 모델 관리 개선
+
+TensorRTModelManager 클래스를 통한 효율적인 다중 모델 관리
+동적으로 모델 등록, 초기화, 해제 기능
+모델 상태 모니터링 및 진단 기능
+
+4. 웜업 기능 통합
+
+초기화 시 자동 웜업을 통한 콜드 스타트 성능 개선
+사용자 정의 웜업 반복 횟수 설정 가능
+```
 
 # TensorRT 추론 서버
 
@@ -30,6 +57,8 @@ drag_v2/
 ├── services/                 # 비즈니스 로직
 │   ├── __init__.py
 │   ├── trt_service.py        # TensorRT 추론 서비스
+│   ├── trt_server_wrapper.py # 안전한 TensorRT 엔진 래퍼
+│   ├── metrics.py            # 성능 지표 수집 및 분석
 │   ├── image_service.py      # 이미지 전처리/후처리
 │   └── stream_service.py     # RTSP 스트림 처리
 │
@@ -83,7 +112,9 @@ drag_v2/
 
 ### 3. 서비스 모듈 (`services/`)
 
-- **trt_service.py**: TensorRT 엔진 관리, 초기화, 추론 실행, 메모리 관리 등 TensorRT 관련 모든 기능
+- **trt_service.py**: TensorRT 엔진 관리, 다중 모델 지원, 성능 모니터링 기능이 추가된 향상된 추론 서비스
+- **trt_server_wrapper.py**: 안전한 TensorRT 엔진 초기화 및 메모리 관리를 위한 래퍼 클래스
+- **metrics.py**: 추론 시간, 처리량 등 성능 지표를 수집하고 분석하는 모듈
 - **image_service.py**: 이미지 전처리(리사이징, 정규화, 패딩 등), 후처리, 좌표 변환 등 이미지 관련 기능
 - **stream_service.py**: RTSP 스트림 관리, 프레임 처리, FPS 제한, MJPEG 스트리밍 등 스트림 관련 기능
 
@@ -144,14 +175,25 @@ drag_v2/
 4. 실시간으로 프레임 캡처 및 객체 감지 처리
 5. MJPEG 형식으로 처리된 프레임 스트리밍
 
+### 다중 모델 관리 워크플로우
+
+1. 서버 시작 시 모든 등록된 모델 초기화
+2. 각 모델은 독립적으로 메모리와 리소스 관리
+3. 성능 지표 수집 및 모니터링 (각 모델별)
+4. API 엔드포인트를 통한 모델 등록, 목록 조회, 해제 등 관리
+5. 안전한 종료 시 모든 모델 리소스 비동기 해제
+
 ## 특징 및 장점
 
 1. **모듈화된 구조**: 각 기능이 명확히 분리되어 유지보수 및 확장이 용이
 2. **메모리 풀링**: GPU 메모리 재사용으로 메모리 효율성 향상 및 지연 시간 감소
 3. **비동기 처리**: FastAPI의 비동기 기능을 활용한 높은 처리량
 4. **RTSP 스트림 지원**: 실시간 비디오 스트림 처리 및 객체 감지
-5. **사용자 친화적 인터페이스**: 웹 기반 UI로 쉬운 사용 및 관리
-6. **확장성**: 다양한 TensorRT 모델 지원 가능
+5. **성능 모니터링**: 실시간 추론 성능 측정 및 분석
+6. **안전한 리소스 관리**: 비동기 작업 중에도 안전한 리소스 해제
+7. **다중 모델 지원**: 여러 TensorRT 모델의 동시 관리 및 사용
+8. **사용자 친화적 인터페이스**: 웹 기반 UI로 쉬운 사용 및 관리
+9. **확장성**: 새로운 모델 및 기능을 쉽게 추가 가능
 
 ## 설치 및 실행
 
@@ -204,7 +246,36 @@ FastAPI의 자동 문서 기능을 통해 API 문서를 확인할 수 있습니�
 ### 새 모델 추가
 
 1. TensorRT 엔진 파일을 `models/trt/` 디렉토리에 저장
-2. 환경 변수 `TRT_MODEL_PATH`를 새 모델 경로로 설정
+2. `TensorRTModelManager`를 사용하여 모델 등록:
+
+```python
+from services.trt_service import model_manager
+
+# 모델 등록
+model_manager.register_model(
+    name="new_model",
+    model_path="models/trt/new_model.trt",
+    enable_metrics=True
+)
+
+# 모델 사용
+new_model_service = model_manager.get_service("new_model")
+result, inference_time = new_model_service.predict(input_data)
+```
+
+### 성능 모니터링
+
+성능 지표 수집을 활성화하고 API 엔드포인트를 통해 모니터링할 수 있습니다:
+
+```python
+# 성능 통계 조회
+@app.get("/models/{model_name}/stats")
+async def get_model_stats(model_name: str):
+    service = model_manager.get_service(model_name)
+    if not service:
+        raise HTTPException(status_code=404, detail=f"Model {model_name} not found")
+    return service.get_performance_stats()
+```
 
 ### 테스트
 
@@ -220,6 +291,7 @@ pytest tests/
 1. **TensorRT 엔진 초기화 실패**
    - 모델 경로 확인
    - GPU와 TensorRT 버전 호환성 확인
+   - 로그에서 상세한 오류 메시지 확인
 
 2. **RTSP 스트림 연결 문제**
    - RTSP URL 형식 확인
@@ -228,6 +300,12 @@ pytest tests/
 3. **메모리 부족 오류**
    - 배치 크기 감소
    - 입력 이미지 크기 축소
+   - 동시에 관리하는 모델 수 제한
+
+4. **성능 저하 문제**
+   - 성능 지표 모니터링으로 병목 지점 파악
+   - 웜업 반복 횟수 증가
+   - 불필요한 모델 해제
 
 ## 라이센스
 
