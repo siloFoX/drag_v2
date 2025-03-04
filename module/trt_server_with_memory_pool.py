@@ -305,13 +305,13 @@ class TRTServerWithMemoryPool:
                 else:
                     # 사용자 제공 데이터 사용
                     host_data = input_data
-                    logger.info(f"입력 '{binding_name}': 사용자 데이터 사용, 형상={host_data.shape}")
+                    # logger.info(f"입력 '{binding_name}': 사용자 데이터 사용, 형상={host_data.shape}")
                 
                 # 입력 데이터를 메모리 풀에 복사
                 self.memory_pool.copy_to_device(binding_name, host_data, self.cuda_stream)
             
             # 추론 실행
-            logger.info("추론 실행 중...")
+            # logger.info("추론 실행 중...")
             start_time = time.time()
             
             # 바인딩 목록 가져오기 (메모리 풀에서)
@@ -353,7 +353,7 @@ class TRTServerWithMemoryPool:
             end_time = time.time()
             inference_time = (end_time - start_time) * 1000  # ms
             
-            logger.info(f"추론 완료: {inference_time:.2f}ms")
+            # logger.info(f"추론 완료: {inference_time:.2f}ms")
             return outputs, inference_time
             
         except Exception as e:
@@ -425,7 +425,7 @@ class TRTServerWithMemoryPool:
 if __name__ == "__main__":
     try:
         # 모델 경로
-        model_path = "models/20240718_gauge_detection.trt"
+        model_path = "models/trt/20240718_gauge_detection.trt"
         
         # 파일 존재 확인
         if os.path.exists(model_path):
