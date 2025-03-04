@@ -19,7 +19,12 @@ PORT = int(os.environ.get("PORT", 5000))
 # Model configuration
 # TODO : 여러 모델을 사용할 수 있도록 환경 변수를 설정해야함
 # TODO : Memory pooling을 사용할 수 있도록 설정해야함
-MODEL_PATH = os.environ.get("TRT_MODEL_PATH", "models/trt/20240718_gauge_detection.trt")
+MODEL_PATHs = ["models/trt/gauge_detection_20240718.trt", "models/trt/gauge_feature_detection.trt", "models/trt/digital_gauge_ocr_20240807.trt", "models/trt/digital_gauge_segmentation_20240801.trt"]
+GAUGE_DETECT_MODEL_PATH = os.environ.get("TRT_MODEL_PATH", "models/trt/gauge_detection_20240718.trt")
+GAUGE_FEATURE_MODEL_PATH = os.environ.get("TRT_MODEL_PATH", "models/trt/gauge_feature_detection.trt")
+DIGITAL_OCR_MODEL_PATH = os.environ.get("TRT_MODEL_PATH", "models/trt/digital_gauge_ocr_20240807.trt")
+DIGITAL_GAUGE_SEGMENTATION_MODEL_PATH = os.environ.get("TRT_MODEL_PATH", "models/trt/digital_gauge_segmentation_20240801.trt")
+
 USE_CUDA_STREAM = os.environ.get("USE_CUDA_STREAM", "True").lower() == "true"
 
 # Detection settings

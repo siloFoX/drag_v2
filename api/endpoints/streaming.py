@@ -9,7 +9,7 @@ from typing import Dict, Any, Optional, List, AsyncGenerator
 from core.config import TEMPLATES_DIR
 from core.logging import logger
 from services.stream_service import stream_service
-from services.trt_service import trt_service
+from services.trt_service import trt_services
 from services.image_service import image_service
 from utils.visualization import visualization_utils
 from models.requests import StreamRequest
@@ -126,6 +126,7 @@ async def video_feed(stream_id: str):
 
 async def process_frame(frame):
     """Process a single frame with the object detection model."""
+    trt_service = trt_services.get("gauge_detection")
     if frame is None or not trt_service.is_initialized():
         return frame
     

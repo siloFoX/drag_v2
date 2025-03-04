@@ -10,7 +10,7 @@ from typing import List, Dict, Any, Optional
 
 from core.config import TEMPLATES_DIR
 from core.logging import logger
-from services.trt_service import trt_service
+from services.trt_service import trt_services
 from services.image_service import image_service
 from utils.visualization import visualization_utils
 from models.requests import JsonPredictionRequest
@@ -32,14 +32,15 @@ async def home(request: Request):
 @router.post("/", response_class=HTMLResponse)
 async def process_image(request: Request, file: UploadFile = File(...)):
     """Process uploaded image and render results."""
-    if not trt_service.is_initialized():
-        return templates.TemplateResponse(
-            "index.html", 
-            {
-                "request": request, 
-                "error": "TensorRT server not initialized"
-            }
-        )
+    for service in trt_services.values():
+        if not service.is_initialized():
+            return templates.TemplateResponse(
+                "index.html", 
+                {
+                    "request": request, 
+                    "error": "TensorRT server not initialized"
+                }
+            )
     
     try:
         # Validate file extension
@@ -57,6 +58,7 @@ async def process_image(request: Request, file: UploadFile = File(...)):
         logger.info(f"Image uploaded: {file.filename}, size: {len(content)} bytes")
         
         # Get input binding details
+        trt_service = trt_services.get("gauge_detect")
         input_shape = trt_service.get_first_input_shape()
         logger.info(f"Model input shape: {input_shape}")
         
@@ -128,8 +130,9 @@ async def process_image(request: Request, file: UploadFile = File(...)):
 @router.post("/predict", response_model=PredictionResponse)
 async def predict_image(file: UploadFile = File(...)):
     """API endpoint for single image prediction."""
-    if not trt_service.is_initialized():
-        raise HTTPException(status_code=503, detail="TensorRT server not initialized")
+    for service in trt_services.values():
+        if not service.is_initialized():
+            raise HTTPException(status_code=503, detail="TensorRT server not initialized")
     
     try:
         # Validate file extension
@@ -140,6 +143,7 @@ async def predict_image(file: UploadFile = File(...)):
         content = await file.read()
         
         # Get input shape
+        trt_service = trt_services.get("gauge_detect")
         input_shape = trt_service.get_first_input_shape()
         
         # Preprocess image
@@ -164,123 +168,123 @@ async def predict_image(file: UploadFile = File(...)):
         logger.error(f"Error during inference: {e}")
         raise HTTPException(status_code=500, detail=f"Error during inference: {str(e)}")
 
-@router.post("/predict/batch", response_model=BatchPredictionResponse)
-async def predict_batch(files: List[UploadFile] = File(...)):
-    """API endpoint for batch image prediction."""
-    if not trt_service.is_initialized():
-        raise HTTPException(status_code=503, detail="TensorRT server not initialized")
+# @router.post("/predict/batch", response_model=BatchPredictionResponse)
+# async def predict_batch(files: List[UploadFile] = File(...)):
+#     """API endpoint for batch image prediction."""
+#     if not trt_service.is_initialized():
+#         raise HTTPException(status_code=503, detail="TensorRT server not initialized")
     
-    if len(files) == 0:
-        raise HTTPException(status_code=400, detail="At least one file is required")
+#     if len(files) == 0:
+#         raise HTTPException(status_code=400, detail="At least one file is required")
     
-    try:
-        results = []
-        total_inference_time = 0
+#     try:
+#         results = []
+#         total_inference_time = 0
         
-        # Get input shape
-        input_shape = trt_service.get_first_input_shape()
+#         # Get input shape
+#         input_shape = trt_service.get_first_input_shape()
         
-        # Process each file
-        for file in files:
-            # Validate file extension
-            if not file.filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
-                logger.warning(f"Unsupported file format: {file.filename}")
-                results.append({
-                    "filename": file.filename,
-                    "error": "Unsupported file format"
-                })
-                continue
+#         # Process each file
+#         for file in files:
+#             # Validate file extension
+#             if not file.filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
+#                 logger.warning(f"Unsupported file format: {file.filename}")
+#                 results.append({
+#                     "filename": file.filename,
+#                     "error": "Unsupported file format"
+#                 })
+#                 continue
             
-            try:
-                # Read file
-                content = await file.read()
+#             try:
+#                 # Read file
+#                 content = await file.read()
                 
-                # Preprocess image
-                preprocessed_data, _ = image_service.preprocess_image(content, input_shape)
+#                 # Preprocess image
+#                 preprocessed_data, _ = image_service.preprocess_image(content, input_shape)
                 
-                # Run inference
-                outputs, inference_time = trt_service.predict(preprocessed_data)
-                total_inference_time += inference_time
+#                 # Run inference
+#                 outputs, inference_time = trt_service.predict(preprocessed_data)
+#                 total_inference_time += inference_time
                 
-                # Postprocess results
-                processed_results = image_service.postprocess_output(outputs)
+#                 # Postprocess results
+#                 processed_results = image_service.postprocess_output(outputs)
                 
-                results.append({
-                    "filename": file.filename,
-                    "inference_time_ms": inference_time,
-                    "results": processed_results
-                })
+#                 results.append({
+#                     "filename": file.filename,
+#                     "inference_time_ms": inference_time,
+#                     "results": processed_results
+#                 })
                 
-            except Exception as e:
-                logger.error(f"Error processing file {file.filename}: {e}")
-                results.append({
-                    "filename": file.filename,
-                    "error": str(e)
-                })
+#             except Exception as e:
+#                 logger.error(f"Error processing file {file.filename}: {e}")
+#                 results.append({
+#                     "filename": file.filename,
+#                     "error": str(e)
+#                 })
         
-        return {
-            "success": True,
-            "total_files": len(files),
-            "processed_files": len(results),
-            "total_inference_time_ms": total_inference_time,
-            "results": results
-        }
+#         return {
+#             "success": True,
+#             "total_files": len(files),
+#             "processed_files": len(results),
+#             "total_inference_time_ms": total_inference_time,
+#             "results": results
+#         }
     
-    except Exception as e:
-        logger.error(f"Error during batch inference: {e}")
-        raise HTTPException(status_code=500, detail=f"Error during batch inference: {str(e)}")
+#     except Exception as e:
+#         logger.error(f"Error during batch inference: {e}")
+#         raise HTTPException(status_code=500, detail=f"Error during batch inference: {str(e)}")
 
-@router.post("/predict/json", response_model=PredictionResponse)
-async def predict_json(data: JsonPredictionRequest):
-    """API endpoint for JSON-based prediction."""
-    if not trt_service.is_initialized():
-        raise HTTPException(status_code=503, detail="TensorRT server not initialized")
+# @router.post("/predict/json", response_model=PredictionResponse)
+# async def predict_json(data: JsonPredictionRequest):
+#     """API endpoint for JSON-based prediction."""
+#     if not trt_service.is_initialized():
+#         raise HTTPException(status_code=503, detail="TensorRT server not initialized")
     
-    try:
-        # Get first input binding name
-        default_input_name = trt_service.get_first_input_name()
+#     try:
+#         # Get first input binding name
+#         default_input_name = trt_service.get_first_input_name()
         
-        # Prepare input data
-        inputs = data.inputs
-        input_name = list(inputs.keys())[0] if inputs else default_input_name
-        input_data = inputs.get(input_name)
+#         # Prepare input data
+#         inputs = data.inputs
+#         input_name = list(inputs.keys())[0] if inputs else default_input_name
+#         input_data = inputs.get(input_name)
         
-        if not input_data:
-            raise HTTPException(status_code=400, detail=f"No data for input '{input_name}'")
+#         if not input_data:
+#             raise HTTPException(status_code=400, detail=f"No data for input '{input_name}'")
         
-        # Convert to NumPy array
-        try:
-            np_data = np.array(input_data, dtype=np.float32)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Error converting input data to NumPy array: {str(e)}")
+#         # Convert to NumPy array
+#         try:
+#             np_data = np.array(input_data, dtype=np.float32)
+#         except Exception as e:
+#             raise HTTPException(status_code=400, detail=f"Error converting input data to NumPy array: {str(e)}")
         
-        # Match input shape
-        expected_shape = trt_service.get_first_input_shape()
-        try:
-            if np_data.shape != expected_shape:
-                logger.warning(f"Input shape mismatch. Expected: {expected_shape}, Got: {np_data.shape}. Attempting resize...")
-                np_data = np.resize(np_data, expected_shape)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Error resizing input data: {str(e)}")
+#         # Match input shape
+#         expected_shape = trt_service.get_first_input_shape()
+#         try:
+#             if np_data.shape != expected_shape:
+#                 logger.warning(f"Input shape mismatch. Expected: {expected_shape}, Got: {np_data.shape}. Attempting resize...")
+#                 np_data = np.resize(np_data, expected_shape)
+#         except Exception as e:
+#             raise HTTPException(status_code=400, detail=f"Error resizing input data: {str(e)}")
         
-        # Run inference
-        start_time = time.time()
-        outputs, inference_time = trt_service.predict(np_data)
-        total_time = (time.time() - start_time) * 1000  # ms
+#         # Run inference
+#         start_time = time.time()
+#         outputs, inference_time = trt_service.predict(np_data)
+#         total_time = (time.time() - start_time) * 1000  # ms
         
-        # Postprocess results
-        results = image_service.postprocess_output(outputs)
+#         # Postprocess results
+#         results = image_service.postprocess_output(outputs)
         
-        return {
-            "success": True,
-            "inference_time_ms": inference_time,
-            "total_time_ms": total_time,
-            "results": results
-        }
+#         return {
+#             "success": True,
+#             "inference_time_ms": inference_time,
+#             "total_time_ms": total_time,
+#             "results": results
+#         }
     
-    except HTTPException:
-        raise
+#     except HTTPException:
+#         raise
     
-    except Exception as e:
-        logger.error(f"Error during JSON inference: {e}")
-        raise HTTPException(status_code=500, detail=f"Error during JSON inference: {str(e)}")
+#     except Exception as e:
+#         logger.error(f"Error during JSON inference: {e}")
+#         raise HTTPException(status_code=500, detail=f"Error during JSON inference: {str(e)}")
