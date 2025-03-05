@@ -9,8 +9,6 @@ from core.config import STATIC_DIR, HOST, PORT
 from core.logging import logger
 from api.router import api_router
 from services.trt_service import lifespan_handler
-from services.stream_service import stream_service
-from contextlib import asynccontextmanager
 
 def create_application() -> FastAPI:
     """Create and configure the FastAPI application."""

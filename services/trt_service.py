@@ -1,14 +1,15 @@
 """
-메모리 풀링, 다중 모델 지원 및 성능 모니터링 기능이 포함된 확장 TensorRT 추론 서비스.
+효율적인 메모리 관리 및 중복 로드 방지 기능이 포함된 개선된 TensorRT 모델 관리자.
+services/trt_service.py에 추가 또는 교체할 코드입니다.
 """
 import numpy as np
 import time
 import asyncio
+import os
 from typing import Dict, Tuple, List, Any, Optional, Union
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 import sys
-import os
 from datetime import datetime
 
 from core.config import USE_CUDA_STREAM
@@ -16,92 +17,148 @@ from core.config import GAUGE_DETECT_MODEL_PATH as DEFAULT_MODEL_PATH
 from core.config import GAUGE_FEATURE_MODEL_PATH, DIGITAL_OCR_MODEL_PATH, DIGITAL_GAUGE_SEGMENTATION_MODEL_PATH
 from core.logging import logger
 from services.trt_server_wrapper import SafeTRTServerWrapper
-# 메트릭 수집 기능 구현
-class MetricsCollector:
-    """TensorRT 모델의 성능 지표를 수집하고 관리하는 간단한 클래스."""
+from services.metrics import MetricsCollector
+
+class TensorRTServiceRegistry:
+    """
+    모델 경로 기반 레지스트리를 통해 동일한 모델을 중복 로드하지 않도록 관리하는 싱글톤 클래스
+    """
+    _instance = None
     
-    def __init__(self, model_name: str):
-        """MetricsCollector를 초기화합니다.
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(TensorRTServiceRegistry, cls).__new__(cls)
+            cls._instance.path_to_model = {}  # 모델 경로 -> 모델 이름 매핑
+            cls._instance.model_ref_count = {}  # 모델 이름 -> 참조 카운트 매핑
+        return cls._instance
+    
+    def register_model_path(self, model_name: str, model_path: str) -> str:
+        """
+        모델 경로를 레지스트리에 등록하고 해당 경로에 대한 참조 모델 이름 반환
         
         Args:
-            model_name: 모니터링 대상 모델 이름
-        """
-        self.model_name = model_name
-        self.inference_times = []
-        self.total_times = []
-        self.start_time = time.time()
-        self.total_inferences = 0
-        
-    def record_inference(self, inference_time: float, total_time: float) -> None:
-        """추론 성능을 기록합니다.
-        
-        Args:
-            inference_time: 순수 TensorRT 추론 시간 (ms)
-            total_time: 전체 처리 시간 (ms)
-        """
-        self.inference_times.append(inference_time)
-        self.total_times.append(total_time)
-        self.total_inferences += 1
-        
-        # 최대 1000개 샘플만 유지
-        if len(self.inference_times) > 1000:
-            self.inference_times.pop(0)
-            self.total_times.pop(0)
-    
-    def get_statistics(self) -> Dict[str, Any]:
-        """수집된 성능 지표에 대한 통계를 반환합니다.
-        
+            model_name: 등록할 모델 이름
+            model_path: 모델 파일 경로
+            
         Returns:
-            Dict[str, Any]: 성능 통계 딕셔너리
+            str: 해당 경로에 대응하는 모델 이름 (이미 등록된 경우 기존 이름 반환)
         """
-        if not self.inference_times:
-            return {
-                "model_name": self.model_name,
-                "status": "no_data",
-                "total_inferences": 0
-            }
+        # 이미 경로가 등록되어 있는지 확인
+        if model_path in self.path_to_model:
+            existing_name = self.path_to_model[model_path]
+            # 참조 카운트 증가
+            self.model_ref_count[existing_name] += 1
+            logger.info(f"모델 경로 '{model_path}'는 이미 '{existing_name}'으로 등록되어 있습니다. 참조 카운트: {self.model_ref_count[existing_name]}")
+            return existing_name
         
-        # 기본 통계 계산
-        avg_inference = sum(self.inference_times) / len(self.inference_times)
-        avg_total = sum(self.total_times) / len(self.total_times)
-        max_inference = max(self.inference_times)
-        min_inference = min(self.inference_times)
+        # 새 모델 등록
+        self.path_to_model[model_path] = model_name
+        self.model_ref_count[model_name] = 1
+        logger.info(f"새 모델 '{model_name}' 경로 등록: {model_path}")
+        return model_name
+    
+    def unregister_model(self, model_name: str) -> bool:
+        """
+        모델 참조 해제. 참조 카운트가 0이 되면 경로 매핑도 제거
         
-        # 처리량 계산
-        uptime = time.time() - self.start_time
-        throughput = self.total_inferences / uptime if uptime > 0 else 0
+        Args:
+            model_name: 등록 해제할 모델 이름
+            
+        Returns:
+            bool: 성공적으로 등록 해제되었으면 True
+        """
+        if model_name not in self.model_ref_count:
+            logger.warning(f"모델 '{model_name}'은 레지스트리에 등록되어 있지 않습니다.")
+            return False
         
-        return {
-            "model_name": self.model_name,
-            "inference_time_ms": {
-                "avg": round(avg_inference, 2),
-                "min": round(min_inference, 2),
-                "max": round(max_inference, 2)
-            },
-            "total_time_ms": {
-                "avg": round(avg_total, 2)
-            },
-            "throughput": round(throughput, 2),
-            "total_inferences": self.total_inferences,
-            "samples_count": len(self.inference_times),
-            "uptime_seconds": round(uptime, 2)
-        }
+        # 참조 카운트 감소
+        self.model_ref_count[model_name] -= 1
+        logger.info(f"모델 '{model_name}' 참조 카운트 감소: {self.model_ref_count[model_name]}")
+        
+        # 참조 카운트가 0이면 경로 매핑 제거
+        if self.model_ref_count[model_name] <= 0:
+            # 경로 매핑 제거
+            paths_to_remove = [path for path, name in self.path_to_model.items() if name == model_name]
+            for path in paths_to_remove:
+                del self.path_to_model[path]
+            
+            # 참조 카운트 제거
+            del self.model_ref_count[model_name]
+            logger.info(f"모델 '{model_name}' 레지스트리에서 완전히 제거됨")
+        
+        return True
+    
+    def get_actual_model_name(self, model_path: str) -> Optional[str]:
+        """
+        모델 경로에 대응하는 실제 모델 이름 반환
+        
+        Args:
+            model_path: 모델 파일 경로
+            
+        Returns:
+            str or None: 등록된 모델 이름 또는 None
+        """
+        return self.path_to_model.get(model_path)
+    
+    def get_ref_count(self, model_name: str) -> int:
+        """
+        모델의 현재 참조 카운트 반환
+        
+        Args:
+            model_name: 모델 이름
+            
+        Returns:
+            int: 참조 카운트 (등록되지 않은 경우 0)
+        """
+        return self.model_ref_count.get(model_name, 0)
+    
+    def is_registered(self, model_path: str) -> bool:
+        """
+        모델 경로가 레지스트리에 등록되어 있는지 확인
+        
+        Args:
+            model_path: 모델 파일 경로
+            
+        Returns:
+            bool: 등록되어 있으면 True
+        """
+        return model_path in self.path_to_model
+
+# 싱글톤 레지스트리 인스턴스
+model_registry = TensorRTServiceRegistry()
 
 class TensorRTService:
-    """TensorRT 엔진 및 추론을 위한 확장 기능이 포함된 서비스."""
+    """TensorRT 엔진 및 추론을 위한 서비스."""
     
-    def __init__(self, model_path: str = DEFAULT_MODEL_PATH, enable_metrics: bool = True):
+    def __init__(self, model_path: str = DEFAULT_MODEL_PATH, enable_metrics: bool = True, model_name: str = None):
         """TensorRT 서비스를 초기화합니다.
         
         Args:
             model_path: TensorRT 엔진 파일 경로
             enable_metrics: 성능 지표 수집 여부
+            model_name: 모델 이름 (None이면 경로에서 추출)
         """
         self.trt_server = None
         self.model_path = model_path
         self.use_cuda_stream = USE_CUDA_STREAM
-        self.model_name = model_path.split('/')[-1].split('.')[0]
+        
+        # 모델 파일 존재 확인
+        if not os.path.exists(model_path):
+            logger.error(f"모델 파일을 찾을 수 없음: {model_path}")
+            self._initialized = False
+            return
+        
+        # 모델 이름이 제공되지 않은 경우 파일 이름 사용
+        if model_name is None:
+            self.model_name = os.path.basename(model_path).split('.')[0]
+        else:
+            self.model_name = model_name
+        
         self.enable_metrics = enable_metrics
+        self._initialized = False
+        
+        # 레지스트리에 등록
+        self.registered_name = model_registry.register_model_path(self.model_name, self.model_path)
         
         # 성능 지표
         if self.enable_metrics:
@@ -117,12 +174,17 @@ class TensorRTService:
             bool: 초기화가 성공적으로 완료되면 True, 그렇지 않으면 False.
         """
         try:
-            logger.info(f"{self.model_name}용 TensorRT 서버 초기화 중... 모델: {self.model_path}")
+            # 이미 초기화된 경우
+            if self._initialized and self.trt_server:
+                logger.info(f"{self.model_name} 모델이 이미 초기화되어 있습니다.")
+                return True
             
+            logger.info(f"{self.model_name}용 TensorRT 서버 초기화 중... 모델: {self.model_path}")
+
             # 모델 파일이 존재하는지 확인
             if not os.path.exists(self.model_path):
                 logger.error(f"모델 파일을 찾을 수 없음: {self.model_path}")
-                return False
+                return False            
             
             # 안전한 래퍼로 TensorRT 서버 초기화
             self.trt_server = SafeTRTServerWrapper(self.model_path, use_stream=self.use_cuda_stream)
@@ -133,14 +195,19 @@ class TensorRTService:
             
             # 초기 성능 향상을 위한 웜업 수행
             self._warm_up()
-            
+
+            self._initialized = True
             logger.info(f"{self.model_name} TensorRT 서버 초기화 완료")
             return True
             
         except Exception as e:
             logger.error(f"{self.model_name} TensorRT 서버 초기화 오류: {e}")
+            self._initialized = False
+            if self.trt_server:
+                self.trt_server.release(safe_exit=True)
+                self.trt_server = None
             return False
-    
+
     def _warm_up(self, num_runs: int = 3) -> None:
         """더미 데이터로 추론을 실행하여 모델을 웜업합니다.
         
@@ -168,11 +235,22 @@ class TensorRTService:
             
         except Exception as e:
             logger.error(f"{self.model_name} 모델 웜업 중 오류 발생: {e}")
-    
+
     async def release(self) -> None:
         """TensorRT 서버 리소스를 안전하게 해제합니다."""
-        if self.trt_server:
-            logger.info(f"{self.model_name}용 TensorRT 서버 리소스 해제 중...")
+        if not self._initialized or self.trt_server is None:
+            logger.info(f"{self.model_name} 모델이 초기화되지 않았거나 이미 해제되었습니다.")
+            return
+        
+        logger.info(f"{self.model_name}용 TensorRT 서버 리소스 해제 중...")
+        
+        # 레지스트리에서 참조 카운트 감소
+        model_registry.unregister_model(self.registered_name)
+        ref_count = model_registry.get_ref_count(self.registered_name)
+        
+        # 참조 카운트가 0인 경우에만 실제로 리소스 해제
+        if ref_count <= 0:
+            logger.info(f"{self.model_name} 모델의 참조 카운트가 0이므로 실제로 리소스 해제 수행")
             
             # 비동기 작업이 완료될 때까지 기다리기
             try:
@@ -203,6 +281,10 @@ class TensorRTService:
                 self.trt_server = None
             
             logger.info(f"{self.model_name}용 TensorRT 서버 리소스 해제됨")
+        else:
+            logger.info(f"{self.model_name} 모델의 참조 카운트가 {ref_count}이므로 실제 리소스 해제 생략")
+        
+        self._initialized = False
     
     def is_initialized(self) -> bool:
         """TensorRT 서버가 초기화되었는지 확인합니다.
@@ -210,7 +292,7 @@ class TensorRTService:
         Returns:
             bool: 초기화된 경우 True, 그렇지 않으면 False.
         """
-        return self.trt_server is not None and hasattr(self.trt_server, '_initialized') and self.trt_server._initialized
+        return self._initialized and self.trt_server is not None and hasattr(self.trt_server, '_initialized') and self.trt_server._initialized
     
     def predict(self, input_data: np.ndarray) -> Tuple[Dict[str, np.ndarray], float]:
         """입력 데이터에 대해 추론을 실행합니다.
@@ -331,10 +413,13 @@ class TensorRTService:
         if not self.is_initialized():
             raise RuntimeError(f"{self.model_name} TensorRT 서버가 초기화되지 않음")
             
+        # 서버에서 직접 바인딩 형상 정보 얻기
         first_input_idx = self.trt_server.input_binding_idxs[0]
         input_name = self.trt_server.engine.get_binding_name(first_input_idx)
-        return self.trt_server.binding_shapes[input_name]
-    
+        
+        # 바인딩 형상 반환
+        return tuple(self.trt_server.binding_shapes[input_name])
+
     def get_first_input_name(self) -> str:
         """첫 번째 입력 바인딩의 이름을 가져옵니다.
         
@@ -381,7 +466,6 @@ class TensorRTService:
             return {"status": "metrics_disabled_or_not_initialized"}
             
         return self.metrics.get_statistics()
-        
 class TensorRTModelManager:
     """여러 TensorRT 모델 관리."""
     
@@ -400,11 +484,38 @@ class TensorRTModelManager:
         Returns:
             bool: 등록 및 초기화가 성공하면 True
         """
-        if name in self.services:
-            logger.warning(f"모델 '{name}'이(가) 이미 등록되어 있습니다. 먼저 해제하십시오.")
-            return False
+        # 이미 등록된 서비스가 있고 초기화된 경우 성공 반환
+        if name in self.services and self.services[name].is_initialized():
+            logger.info(f"모델 '{name}'이(가) 이미 등록되고 초기화되어 있습니다.")
+            return True
+        
+        # 이미 경로에 해당하는 모델이 로드되어 있는지 확인
+        actual_model_name = model_registry.get_actual_model_name(model_path)
+        if actual_model_name and actual_model_name != name:
+            logger.info(f"모델 경로 '{model_path}'가 이미 '{actual_model_name}'로 로드되어 있습니다. '{name}'과 연결합니다.")
             
-        service = TensorRTService(model_path, enable_metrics)
+            # 동일한 경로에 대한 다른 서비스 인스턴스 찾기
+            for existing_name, service in self.services.items():
+                if service.model_path == model_path and service.is_initialized():
+                    # 기존 서비스를 새 이름으로 등록
+                    self.services[name] = service
+                    logger.info(f"기존 로드된 모델을 '{name}' 이름으로 추가 등록했습니다.")
+                    return True
+        
+        # 모델이 등록되어 있지만 초기화되지 않은 경우 재초기화 시도
+        if name in self.services:
+            logger.info(f"모델 '{name}'이(가) 등록되어 있지만 초기화되지 않았습니다. 재초기화 시도 중...")
+            success = self.services[name].initialize()
+            if success:
+                logger.info(f"모델 '{name}'이(가) 성공적으로 재초기화되었습니다.")
+            else:
+                logger.error(f"모델 '{name}'을(를) 재초기화하지 못했습니다.")
+                # 초기화 실패 시 서비스 제거
+                del self.services[name]
+            return success
+        
+        # 새로운 모델 생성 및 초기화
+        service = TensorRTService(model_path, enable_metrics, model_name=name)
         success = service.initialize()
         
         if success:
@@ -414,6 +525,28 @@ class TensorRTModelManager:
             logger.error(f"모델 '{name}'을(를) 초기화하지 못했습니다.")
             
         return success
+    
+    def get_or_create_service(self, name: str, model_path: str, enable_metrics: bool = True) -> Optional[TensorRTService]:
+        """이름으로 서비스를 가져오거나, 없으면 생성합니다.
+        
+        Args:
+            name: 서비스 이름
+            model_path: 없을 경우 생성에 사용할 모델 경로
+            enable_metrics: 성능 지표 수집 여부
+            
+        Returns:
+            TensorRTService or None: 서비스 인스턴스 또는 생성 실패 시 None
+        """
+        # 이미 등록된 서비스가 있고 초기화된 경우 반환
+        service = self.get_service(name)
+        if service and service.is_initialized():
+            return service
+        
+        # 없거나 초기화되지 않은 경우 등록 시도
+        if self.register_model(name, model_path, enable_metrics):
+            return self.get_service(name)
+        
+        return None
         
     def get_service(self, name: str) -> Optional[TensorRTService]:
         """이름으로 서비스를 가져옵니다.
@@ -434,10 +567,11 @@ class TensorRTModelManager:
             try:
                 logger.info(f"'{name}' 서비스 해제 중...")
                 await service.release()
-                del self.services[name]
             except Exception as e:
                 logger.error(f"'{name}' 서비스 해제 중 오류: {e}")
                 
+        # 서비스 목록 비우기
+        self.services.clear()
         logger.info("모든 TensorRT 모델이 해제되었습니다.")
         
     async def release_model(self, name: str) -> bool:
@@ -461,21 +595,143 @@ class TensorRTModelManager:
         except Exception as e:
             logger.error(f"모델 '{name}' 해제 중 오류: {e}")
             return False
-            
+    
     def list_models(self) -> List[Dict[str, Any]]:
         """등록된 모든 모델과 그 상태를 나열합니다.
         
         Returns:
             List[Dict]: 모델 정보 리스트
         """
-        return [
-            {
+        models_info = []
+        
+        for name, service in self.services.items():
+            info = {
                 "name": name,
                 "status": "initialized" if service.is_initialized() else "not_initialized",
-                "model_path": service.model_path
+                "model_path": service.model_path,
+                "ref_count": model_registry.get_ref_count(service.registered_name)
             }
-            for name, service in self.services.items()
-        ]
+            
+            # 성능 지표 추가 (있는 경우)
+            if service.enable_metrics and hasattr(service, 'metrics'):
+                stats = service.metrics.get_statistics()
+                if stats and stats.get("status") != "no_data":
+                    info["performance"] = {
+                        "avg_inference_time_ms": stats["inference_time_ms"]["avg"],
+                        "throughput": stats["throughput"],
+                        "total_inferences": stats["total_inferences"]
+                    }
+            
+            models_info.append(info)
+            
+        return models_info
+
+
+# 순차적 모델 초기화 함수 - CUDA 컨텍스트 충돌 방지
+async def initialize_models(model_manager: TensorRTModelManager, models_config: Dict[str, str]) -> bool:
+    """
+    여러 모델을 순차적으로(한 번에 하나씩) 초기화
+    
+    Args:
+        model_manager: 모델 관리자 인스턴스
+        models_config: 모델 이름과 경로 매핑 딕셔너리
+        
+    Returns:
+        bool: 핵심 모델이 성공적으로 초기화되면 True
+    """
+    logger.info("모든 TensorRT 모델 순차적으로 초기화 중...")
+    
+    success = True
+    core_models_success = True
+    
+    # 핵심 모델(처음에 반드시 초기화되어야 하는 모델) 목록
+    core_models = ["gauge_detect", "gauge_feature"]
+    
+    # 핵심 모델 먼저 처리
+    for name in core_models:
+        if name not in models_config:
+            logger.warning(f"핵심 모델 '{name}'이(가) 모델 구성에 없습니다")
+            core_models_success = False
+            continue
+            
+        path = models_config[name]
+        if not os.path.exists(path):
+            logger.error(f"핵심 모델 파일을 찾을 수 없음: {path}")
+            core_models_success = False
+            continue
+        
+        # 이미 초기화된 모델이면 건너뛰기
+        if name in model_manager.services and model_manager.services[name].is_initialized():
+            logger.info(f"핵심 모델 '{name}'이(가) 이미 초기화되어 있습니다")
+            continue
+            
+        # 순차적으로 초기화
+        logger.info(f"핵심 모델 '{name}' 초기화 중...")
+        try:
+            service = TensorRTService(path, enable_metrics=True, model_name=name)
+            model_manager.services[name] = service
+            
+            # 동기적으로 초기화 - 한 번에 하나의 모델만 초기화하도록
+            result = service.initialize()
+            
+            if not result:
+                logger.error(f"핵심 모델 '{name}' 초기화 실패")
+                core_models_success = False
+            else:
+                logger.info(f"핵심 모델 '{name}' 초기화 성공")
+        except Exception as e:
+            logger.error(f"핵심 모델 '{name}' 초기화 중 오류: {e}")
+            core_models_success = False
+    
+    # 핵심 모델 초기화 실패 시 다른 모델은 초기화하지 않음
+    if not core_models_success:
+        logger.error("핵심 모델 초기화 실패. 다른 모델 초기화 건너뜀")
+        return False
+        
+    # 나머지 모델 처리 (핵심 모델이 아닌 모델)
+    for name, path in models_config.items():
+        # 핵심 모델이면 건너뛰기 (이미 처리됨)
+        if name in core_models:
+            continue
+            
+        # 모델 파일 존재 확인
+        if not os.path.exists(path):
+            logger.error(f"모델 파일을 찾을 수 없음: {path}")
+            success = False
+            continue
+            
+        # 이미 초기화된 모델이면 건너뛰기
+        if name in model_manager.services and model_manager.services[name].is_initialized():
+            logger.info(f"모델 '{name}'이(가) 이미 초기화되어 있습니다")
+            continue
+            
+        # 순차적으로 초기화
+        try:
+            service = TensorRTService(path, enable_metrics=True, model_name=name)
+            model_manager.services[name] = service
+            
+            # 동기적으로 초기화
+            result = service.initialize()
+            
+            if not result:
+                logger.error(f"모델 '{name}' 초기화 실패")
+                success = False
+            else:
+                logger.info(f"모델 '{name}' 초기화 성공")
+        except Exception as e:
+            logger.error(f"모델 '{name}' 초기화 중 오류: {e}")
+            success = False
+    
+    # 초기화 결과 로깅
+    initialized_models = [name for name, service in model_manager.services.items() if service.is_initialized()]
+    logger.info(f"초기화된 모델: {initialized_models}")
+    
+    failed_models = [name for name, service in model_manager.services.items() if not service.is_initialized()]
+    if failed_models:
+        logger.warning(f"초기화 실패한 모델: {failed_models}")
+    
+    # 핵심 모델이 성공적으로 초기화되었으면 전체 결과와 상관없이 True 반환
+    return core_models_success
 
 # 모델 관리자 생성
 model_manager = TensorRTModelManager()
@@ -492,6 +748,7 @@ default_models = {
 trt_service = None
 trt_services = {}
 
+# 기존 lifespan_handler에서 사용할 비동기 초기화 함수로 대체
 @asynccontextmanager
 async def lifespan_handler(app: FastAPI):
     """애플리케이션 라이프사이클 관리.
@@ -504,28 +761,27 @@ async def lifespan_handler(app: FastAPI):
     global trt_service, trt_services
     
     # 시작 코드(서버 초기화)
-    success = True
     
     # 기본 모델 등록
-    for name, path in default_models.items():
-        model_success = model_manager.register_model(name, path)
-        if not model_success:
-            logger.error(f"{name} TensorRT 서비스 초기화 실패")
-        success = success and model_success
-        
-        # 이전 버전과의 호환성을 위한 서비스 참조 저장
-        if model_success:
-            trt_services[name] = model_manager.get_service(name)
+    success = await initialize_models(model_manager, default_models)
+    
+    # 이전 버전과의 호환성을 위한 서비스 참조 저장
+    for name, service in model_manager.services.items():
+        if service.is_initialized():
+            trt_services[name] = service
     
     # gauge_detect를 기본 서비스로 설정(이전 버전과의 호환성을 위해)
     if "gauge_detect" in trt_services:
         trt_service = trt_services["gauge_detect"]
     
     if not success:
-        logger.error("모든 TensorRT 서비스를 초기화하지 못했습니다. 종료 중...")
-        sys.exit(1)
-    
-    logger.info("모든 TensorRT 서비스가 성공적으로 초기화되었습니다.")
+        logger.warning("일부 TensorRT 서비스를 초기화하지 못했습니다. 제한된 기능으로 계속 실행됩니다.")
+        # 중요한 모델이 없으면 종료, 그렇지 않으면 계속 실행
+        if "gauge_detect" not in trt_services or "gauge_feature" not in trt_services:
+            logger.error("핵심 모델을 초기화하지 못했습니다. 종료 중...")
+            sys.exit(1)
+    else:
+        logger.info("모든 TensorRT 서비스가 성공적으로 초기화되었습니다.")
     
     yield  # 애플리케이션 실행 중
     
