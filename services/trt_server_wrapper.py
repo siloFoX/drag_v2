@@ -110,29 +110,30 @@ class SafeTRTServerWrapper:
                 if safe_exit:
                     self._restore_signal_handlers()
                 
-                # 안전한 리소스 해제 시퀀스
+                # CUDA 동기화 먼저 실행
                 try:
-                    # 메모리 풀 참조를 분리하기 전 CUDA 동기화
-                    if hasattr(self.trt_server, 'cuda_stream') and self.trt_server.cuda_stream:
-                        try:
-                            import pycuda.driver as cuda
-                            cuda.Context.synchronize()
-                            logger.info("CUDA 컨텍스트 동기화 완료")
-                        except (ImportError, Exception) as e:
-                            logger.warning(f"CUDA 컨텍스트 동기화 실패: {e}")
-                    
-                    # 각 필드를 명시적으로 None으로 설정하여 해제
-                    if hasattr(self.trt_server, 'release'):
-                        self.trt_server.release()
+                    import pycuda.driver as cuda
+                    if cuda.Context.get_current():
+                        cuda.Context.synchronize()
+                        logger.info("CUDA 컨텍스트 동기화 완료")
                 except Exception as e:
-                    logger.error(f"TensorRT 서버 릴리스 중 오류: {e}")
+                    logger.warning(f"CUDA 컨텍스트 동기화 실패 (무시 가능): {e}")
                 
-                # 명시적 메모리 정리
+                # TRT 서버의 release 메서드 호출
+                if hasattr(self.trt_server, 'release'):
+                    try:
+                        self.trt_server.release()
+                    except Exception as e:
+                        logger.error(f"TRT 서버 release 메서드 호출 중 오류: {e}")
+                
+                # 명시적으로 참조 제거
                 self.trt_server = None
+                
+                # 가비지 컬렉션 강제 실행
                 gc.collect()
                 
-                # 20ms 대기하여 리소스가 적절히 해제되도록 함
-                time.sleep(0.02)
+                # 짧은 대기 시간 추가
+                time.sleep(0.05)
                 
                 self._initialized = False
                 logger.info("TensorRT 서버 리소스 해제 완료")

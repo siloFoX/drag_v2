@@ -35,6 +35,26 @@ class TRTMemoryPool:
         
         # 메모리 버퍼 초기화
         self._allocate_buffers()
+
+        # CUDA 컨텍스트 관리 개선
+        self.cuda_ctx = None
+        try:
+            # 현재 컨텍스트 가져오기
+            current_ctx = cuda.Context.get_current()
+            if current_ctx:
+                self.cuda_ctx = current_ctx
+                logger.info("기존 CUDA 컨텍스트 사용")
+            else:
+                # 새 컨텍스트 생성
+                self.cuda_ctx = cuda.Context.create_new_context()
+                logger.info("새 CUDA 컨텍스트 생성")
+            
+            # 컨텍스트 푸시 (스택에 이미 있어도 안전)
+            if not cuda.Context.get_current():
+                self.cuda_ctx.push()
+                logger.info("CUDA 컨텍스트 푸시됨")
+        except Exception as e:
+            logger.error(f"CUDA 컨텍스트 초기화 오류: {e}")
         
     def _allocate_buffers(self):
         """모든 바인딩에 대한 메모리 할당"""
@@ -173,6 +193,21 @@ class TRTServerWithMemoryPool:
         self.model_path = model_path
         self.use_stream = use_stream
         
+        # CUDA 컨텍스트 관리 추가
+        try:
+            self.cuda_ctx = cuda.Context.get_current()
+            if not self.cuda_ctx:
+                logger.warning("현재 CUDA 컨텍스트가 없습니다. 새 컨텍스트를 생성합니다.")
+                self.cuda_ctx = cuda.Context.create_new_context()
+            else:
+                logger.info("기존 CUDA 컨텍스트를 사용합니다.")
+            # 컨텍스트 푸시
+            self.cuda_ctx.push()
+        except Exception as e:
+            logger.error(f"CUDA 컨텍스트 설정 오류: {e}")
+            self.cuda_ctx = None
+        
+        # 기존 코드
         # TensorRT 플러그인 로드
         logger.info("TensorRT 플러그인 로드 중...")
         trt.init_libnvinfer_plugins(None, "")
@@ -306,6 +341,14 @@ class TRTServerWithMemoryPool:
                     # 사용자 제공 데이터 사용
                     host_data = input_data
                     # logger.info(f"입력 '{binding_name}': 사용자 데이터 사용, 형상={host_data.shape}")
+
+                # 입력 데이터가 NCHW 형식으로 설정
+                # 형식 변환 보장을 위해 다음 설정 추가
+                if hasattr(self.context, 'set_binding_shape'):
+                    self.context.set_binding_shape(i, binding_shape)
+                
+                # 데이터 형식 명시적 설정 (NCHW)
+                host_data = host_data.astype(binding_dtype)
                 
                 # 입력 데이터를 메모리 풀에 복사
                 self.memory_pool.copy_to_device(binding_name, host_data, self.cuda_stream)
@@ -391,12 +434,23 @@ class TRTServerWithMemoryPool:
             logger.info(f"웜업 완료. 평균 실행 시간: {avg_time:.2f}ms")
     
     def release(self):
-        """리소스 해제"""
+        """리소스 해제 - CUDA 컨텍스트 관리 강화"""
         logger.info("리소스 해제 중...")
+        
+        # 스트림이 있다면 동기화
+        if hasattr(self, 'cuda_stream') and self.cuda_stream:
+            try:
+                self.cuda_stream.synchronize()
+                logger.info("CUDA 스트림 동기화 완료")
+            except Exception as e:
+                logger.error(f"CUDA 스트림 동기화 오류: {e}")
         
         # 메모리 풀 해제
         if hasattr(self, 'memory_pool'):
-            self.memory_pool.release()
+            try:
+                self.memory_pool.release()
+            except Exception as e:
+                logger.error(f"메모리 풀 해제 오류: {e}")
         
         # TensorRT 리소스 해제
         if hasattr(self, 'context') and self.context:
@@ -411,6 +465,23 @@ class TRTServerWithMemoryPool:
             del self.runtime
             self.runtime = None
         
+        # CUDA 컨텍스트 팝 (푸시한 경우에만)
+        if hasattr(self, 'cuda_ctx') and self.cuda_ctx:
+            try:
+                # 현재 컨텍스트 확인
+                current = cuda.Context.get_current()
+                if current and current == self.cuda_ctx:
+                    self.cuda_ctx.pop()
+                    logger.info("CUDA 컨텍스트 팝 완료")
+            except Exception as e:
+                logger.error(f"CUDA 컨텍스트 팝 오류: {e}")
+        
+        # 강제 동기화 추가
+        try:
+            cuda.Context.synchronize()
+        except:
+            pass
+        
         # 가비지 컬렉션 강제 실행
         gc.collect()
         
@@ -418,7 +489,10 @@ class TRTServerWithMemoryPool:
     
     def __del__(self):
         """소멸자"""
-        self.release()
+        try:
+            self.release()
+        except Exception as e:
+            logger.error(f"소멸자에서 리소스 해제 중 오류: {e}")
 
 
 # 사용 예시

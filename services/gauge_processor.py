@@ -8,6 +8,8 @@ from typing import List, Dict, Any
 
 from core.logging import logger
 from core.exceptions import ProcessingError
+from core.config import GAUGE_DETECT_MODEL_PATH, GAUGE_FEATURE_MODEL_PATH
+from services.trt_service import model_manager
 from services.detection.gauge_detector import gauge_detector
 from services.processing.analog_gauge_processor import analog_gauge_processor
 
@@ -23,20 +25,56 @@ class GaugeProcessor:
         """게이지 프로세서 초기화"""
         self.initialize()
         
+    # gauge_processor.py에서 통합 초기화 관리
     def initialize(self) -> bool:
         """게이지 감지 및 처리 모듈 초기화"""
         try:
-            # 게이지 감지기 초기화
-            detector_initialized = gauge_detector.initialize()
+            # 전역 모델 매니저 참조
+            global model_manager
             
-            # 아날로그 게이지 프로세서 초기화
-            analog_initialized = analog_gauge_processor.initialize()
+            # 1. 게이지 감지기 초기화 - 이미 초기화된 경우 재사용
+            detector_service = model_manager.get_service("gauge_detect")
+            if detector_service and detector_service.is_initialized():
+                logger.info("게이지 감지기 모델이 이미 초기화되어 있습니다")
+                detector_initialized = True
+            else:
+                logger.info("게이지 감지기 모델 초기화 중...")
+                detector_initialized = model_manager.register_model(
+                    "gauge_detect", 
+                    GAUGE_DETECT_MODEL_PATH,
+                    enable_metrics=True
+                )
+                if not detector_initialized:
+                    logger.error("게이지 감지기 모델 초기화 실패")
             
+            # 2. 아날로그 게이지 프로세서 초기화 - 이미 초기화된 경우 재사용
+            analog_service = model_manager.get_service("gauge_feature")
+            if analog_service and analog_service.is_initialized():
+                logger.info("아날로그 게이지 특징 모델이 이미 초기화되어 있습니다")
+                analog_initialized = True
+            else:
+                logger.info("아날로그 게이지 특징 모델 초기화 중...")
+                analog_initialized = model_manager.register_model(
+                    "gauge_feature", 
+                    GAUGE_FEATURE_MODEL_PATH,
+                    enable_metrics=True
+                )
+                if not analog_initialized:
+                    logger.error("아날로그 게이지 특징 모델 초기화 실패")
+                
             # 디지털 게이지 프로세서는 향후 구현
-            # digital_initialized = digital_gauge_processor.initialize()
-            digital_initialized = True  # 임시
+            digital_initialized = True
             
-            success = detector_initialized and analog_initialized and digital_initialized
+            # 초기화 상태 확인 - 모델 서비스 참조 얻기
+            detector_service = model_manager.get_service("gauge_detect")
+            analog_service = model_manager.get_service("gauge_feature")
+            
+            # 서비스 초기화 상태 확인
+            detector_ok = detector_service and detector_service.is_initialized()
+            analog_ok = analog_service and analog_service.is_initialized()
+            
+            # 최종 성공 여부 판단
+            success = detector_ok and analog_ok and digital_initialized
             
             if success:
                 logger.info("게이지 프로세서 초기화 완료")
@@ -80,8 +118,27 @@ class GaugeProcessor:
         }
         
         try:
-            # 1. 게이지 감지
-            detected_gauges = gauge_detector.detect_gauges(image)
+            # CUDA 에러 방지를 위한 안전 모드 - 에러 복구 옵션
+            cuda_error_occurred = False
+            detected_gauges = []
+            
+            try:
+                # 1. 게이지 감지
+                detected_gauges = gauge_detector.detect_gauges(image)
+                
+            except Exception as e:
+                error_str = str(e).lower()
+                if "cuda" in error_str or "resource handle" in error_str:
+                    cuda_error_occurred = True
+                    logger.error(f"CUDA 오류 발생: {e}, 감지 단계 건너뛰기")
+                    # CUDA 에러 시 빈 결과로 계속 진행
+                    result["message"] = "CUDA 리소스 오류, 감지 단계 건너뛰기"
+                    return self._finalize_result(result, start_time)
+                else:
+                    # 다른 일반 오류는 전파
+                    logger.error(f"게이지 감지 중 오류: {e}")
+                    result["message"] = f"감지 중 오류: {str(e)}"
+                    return self._finalize_result(result, start_time)
             
             if not detected_gauges:
                 result["message"] = "이미지에서 게이지가 감지되지 않았습니다"
@@ -133,27 +190,6 @@ class GaugeProcessor:
                 elif gauge_type == "digital":
                     # 디지털 게이지 처리 (향후 구현)
                     gauge_result["message"] = "디지털 게이지 처리는 아직 구현되지 않았습니다"
-                    
-                    # 나중에 디지털 게이지 프로세서가 구현되면 아래와 같이 처리
-                    """
-                    try:
-                        processing_result = digital_gauge_processor.process_gauge(cropped_image)
-                        
-                        # 처리 결과 업데이트
-                        if processing_result["status"] == "성공":
-                            gauge_result.update({
-                                "value": processing_result["value"],
-                                "unit": processing_result["unit"],
-                                "confidence": processing_result["confidence"],
-                                "status": "성공"
-                            })
-                        else:
-                            gauge_result["message"] = "디지털 게이지 처리 실패"
-                            
-                    except Exception as e:
-                        logger.error(f"디지털 게이지 {gauge_id} 처리 중 오류: {e}")
-                        gauge_result["message"] = f"처리 오류: {str(e)}"
-                    """
                 
                 # 결과 추가
                 result["gauges"].append(gauge_result)

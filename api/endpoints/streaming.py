@@ -17,10 +17,14 @@ from models.requests import StreamRequest
 from models.responses import StreamInfo
 
 import threading
+import asyncio
 import cv2
 import time
 
-process_lock = threading.Lock()
+# 전역 처리 동기화를 위한 락 추가 (파일 상단에 추가)
+global_processing_lock = threading.Lock()
+# 결과의 수명 주기 추적을 위한 필드 추가
+stream_results_ttl = {}  # stream_id: timestamp
 
 # 스트림 활성 상태를 추적하기 위한 전역 변수 추가
 active_streams = {}  # stream_id: active_status
@@ -76,14 +80,21 @@ async def add_stream(stream_id: str = Form(...), rtsp_url: str = Form(...)):
 
 @router.delete("/api/streams/{stream_id}")
 async def remove_stream(stream_id: str):
-    """Remove an RTSP stream.
+    """RTSP 스트림 제거"""
+    # 1. 먼저 활성 상태 비활성화 (중요)
+    if stream_id in active_streams:
+        active_streams[stream_id] = False
+        logger.info(f"스트림 '{stream_id}' 비활성화")
     
-    Args:
-        stream_id: Stream identifier
-    """
+    # 2. 짧은 대기 시간 추가 - 진행 중인 작업이 완료될 수 있도록
+    await asyncio.sleep(0.1)
+    
+    # 3. 리소스 정리 (상세 정리 함수로 위임)
+    clean_stream_resources(stream_id)
+    
+    # 4. 스트림 매니저에서 제거
     success = stream_service.remove_stream(stream_id)
-    if not success:
-        raise HTTPException(status_code=404, detail=f"Stream '{stream_id}' not found")
+    logger.info(f"스트림 '{stream_id}' 제거 완료")
     
     return {"status": "success", "message": f"Stream '{stream_id}' removed"}
 
@@ -203,22 +214,25 @@ async def process_frame(frame, stream_id):
     Returns:
         처리된 프레임
     """
-    if frame is None:
+    # 즉시 스트림 상태 확인 (입력 확인 전에)
+    if stream_id not in active_streams or not active_streams.get(stream_id, False):
         return frame
     
-    # 스트림이 비활성화 상태면 처리하지 않음
-    if not active_streams.get(stream_id, False):
+    if frame is None:
         return frame
     
     # 스트림별 값 가져오기
     last_processed_results = stream_results.get(stream_id, None)
     last_full_process_time = stream_process_times.get(stream_id, 0)
-    process_lock = stream_locks.get(stream_id)
     
-    if process_lock is None:
-        # 락이 없으면 생성
-        process_lock = threading.Lock()
-        stream_locks[stream_id] = process_lock
+    # 스트림 락 존재 확인
+    if stream_id not in stream_locks:
+        stream_locks[stream_id] = threading.Lock()
+    process_lock = stream_locks[stream_id]
+    
+    # 처리 전 다시 한번 스트림 상태 확인
+    if not active_streams.get(stream_id, False):
+        return frame
     
     # 원본 프레임 복사
     processed_frame = frame.copy()
@@ -277,14 +291,37 @@ async def process_frame(frame, stream_id):
         return processed_frame
     
     # 락 획득 성공 - 처리 시작
+    global_lock_acquired = False
     try:
+        # 락 획득 후 상태 재확인
+        if stream_id not in active_streams or not active_streams.get(stream_id, False):
+            logger.info(f"락 획득 후 스트림 '{stream_id}' 비활성화 확인, 프레임 처리 중단")
+            return frame
+            
         current_time = time.time()
+        time_since_process = current_time - last_full_process_time
         
         # 일정 간격마다만 전체 게이지 처리 수행
-        time_since_process = current_time - last_full_process_time
         if time_since_process >= process_interval:
-            # 스트림이 여전히 활성 상태인지 재확인
-            if active_streams.get(stream_id, False):
+            # 스트림 상태 재확인
+            if not active_streams.get(stream_id, False):
+                return frame
+                
+            # 전역 락 획득 시도 - CUDA 리소스 충돌 방지
+            if global_processing_lock.acquire(blocking=False):
+                global_lock_acquired = True
+                
+                # 결과 초기화 전 TTL 확인
+                last_result_time = stream_results_ttl.get(stream_id, 0)
+                
+                # 결과가 10초 이상 경과했거나 없으면 완전 초기화
+                if current_time - last_result_time > 10.0 or stream_id not in stream_results:
+                    stream_results[stream_id] = {
+                        "gauges": [],
+                        "processing_time_ms": 0,
+                        "status": "처리 중"
+                    }
+                
                 try:
                     # 전체 게이지 처리
                     result = gauge_processor.process_image(frame)
@@ -293,6 +330,7 @@ async def process_frame(frame, stream_id):
                     if result and isinstance(result, dict) and "gauges" in result:
                         stream_results[stream_id] = result
                         stream_process_times[stream_id] = current_time
+                        stream_results_ttl[stream_id] = current_time
                         
                         gauges_count = len(result["gauges"])
                         logger.info(f"[Stream {stream_id}] 게이지 {gauges_count}개 검출 완료, 처리 시간: {result.get('processing_time_ms', 0):.2f}ms")
@@ -366,13 +404,22 @@ async def process_frame(frame, stream_id):
         
     except Exception as e:
         logger.error(f"[Stream {stream_id}] 프레임 처리 중 오류: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
         return frame
     
     finally:
         # 항상 락 해제
-        process_lock.release()
+        if process_lock.locked():
+            try:
+                process_lock.release()
+            except RuntimeError:
+                pass
+                
+        # 전역 락 해제
+        if global_lock_acquired:
+            try:
+                global_processing_lock.release()
+            except RuntimeError:
+                pass
 
 # 스트림 서비스에 스트림 종료 이벤트 핸들러 추가
 @router.delete("/api/streams/{stream_id}")
@@ -382,30 +429,55 @@ async def remove_stream(stream_id: str):
     Args:
         stream_id: Stream identifier
     """
-    # 스트림 상태 비활성화
-    active_streams[stream_id] = False
+    logger.info(f"스트림 '{stream_id}' 제거 요청 받음")
+    
+    # 스트림 상태 즉시 비활성화
+    if stream_id in active_streams:
+        active_streams[stream_id] = False
+        logger.info(f"스트림 '{stream_id}' 비활성화 완료")
+    
+    # 비동기 작업 처리를 위한 짧은 대기
+    await asyncio.sleep(0.1)  # 100ms 대기
     
     # 스트림 리소스 정리
     clean_stream_resources(stream_id)
     
+    # 처리 중인 프레임 작업 완료 대기
+    # 타임아웃 0.5초 설정으로 최대 대기 시간 제한
+    if stream_id in stream_locks and stream_locks[stream_id].locked():
+        logger.info(f"스트림 '{stream_id}'의 프레임 처리 완료 대기 중...")
+        await asyncio.sleep(0.5)
+    
+    # 스트림 매니저에서 제거
     success = stream_service.remove_stream(stream_id)
     if not success:
-        raise HTTPException(status_code=404, detail=f"Stream '{stream_id}' not found")
+        logger.warning(f"스트림 '{stream_id}'를 스트림 매니저에서 찾을 수 없습니다")
+        # 존재하지 않더라도 관련 데이터는 정리
+        success = True
     
-    logger.info(f"Stream '{stream_id}' removed and resources cleaned up")
+    logger.info(f"스트림 '{stream_id}' 제거 완료")
     return {"status": "success", "message": f"Stream '{stream_id}' removed"}
 
-# 스트림 리소스 정리 함수 추가
+# 스트림 리소스 정리 함수 강화
 def clean_stream_resources(stream_id):
-    """스트림 관련 리소스 정리"""
+    """스트림 관련 리소스 정리 (철저히)"""
+    logger.info(f"스트림 '{stream_id}' 리소스 정리 중...")
+    
+    # 상태 업데이트 다시 확인
+    if stream_id in active_streams:
+        active_streams[stream_id] = False
+    
     # 락 정리
     if stream_id in stream_locks:
-        if stream_locks[stream_id].locked():
-            try:
+        try:
+            # 락이 걸려있으면 강제 해제 시도
+            if stream_locks[stream_id].locked():
+                logger.info(f"스트림 '{stream_id}'의 락이 걸려있어 해제 시도")
                 stream_locks[stream_id].release()
-            except RuntimeError:
-                # 이미 해제된 경우 예외 무시
-                pass
+        except Exception as e:
+            logger.warning(f"스트림 '{stream_id}' 락 해제 중 오류 (무시됨): {e}")
+        
+        # 딕셔너리에서 제거
         del stream_locks[stream_id]
     
     # 결과 정리
@@ -416,11 +488,7 @@ def clean_stream_resources(stream_id):
     if stream_id in stream_process_times:
         del stream_process_times[stream_id]
     
-    # 활성 상태 정리
-    if stream_id in active_streams:
-        del active_streams[stream_id]
-    
-    logger.info(f"Resources for stream '{stream_id}' cleaned up")
+    logger.info(f"스트림 '{stream_id}' 리소스 정리 완료")
 
 # 애플리케이션 종료 시 정리 작업 추가 (필요한 경우 lifespan_handler에 추가)
 def cleanup_all_streams():

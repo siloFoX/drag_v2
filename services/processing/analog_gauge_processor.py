@@ -293,15 +293,7 @@ class AnalogGaugeProcessor:
         }
     
     def _detect_gauge_features(self, image: np.ndarray) -> Tuple[Dict[str, Tuple[int, int]], np.ndarray]:
-        """
-        게이지 특징점 (바늘 시작점, 끝점, 최소값, 최대값) 검출
-        
-        Args:
-            image: 원형 변환된 게이지 이미지
-            
-        Returns:
-            특징점 좌표 딕셔너리, 시각화 이미지
-        """
+        """게이지 특징점 (바늘 시작점, 끝점, 최소값, 최대값) 검출"""
         service = self.get_service()
         if not service:
             logger.warning(f"모델 '{self.model_id}'에 대한 서비스를 찾을 수 없습니다")
@@ -324,15 +316,15 @@ class AnalogGaugeProcessor:
         # 검출 개수가 있는지 확인
         if 'num_dets' in outputs and outputs['num_dets'][0][0] > 0:
             # 검출된 개수
-            num_dets = int(outputs['num_dets'][0][0])
+            num_detections = int(outputs['num_dets'][0][0])
             
             # 클래스별 최고 신뢰도 검출 저장
-            best_detections = {}
+            best_detections = {}  # 여기서 초기화
             
-            for i in range(num_dets):
+            for i in range(num_detections):
                 # 클래스 및 신뢰도 가져오기
-                class_id = int(outputs['det_classes'][0][i])
-                score = float(outputs['det_scores'][0][i])
+                class_id = int(outputs['det_classes'][0][i]) if 'det_classes' in outputs else 0
+                score = float(outputs['det_scores'][0][i]) if 'det_scores' in outputs else 0
                 
                 # 신뢰도 임계값 확인
                 if score < self.conf_thres:
@@ -348,27 +340,28 @@ class AnalogGaugeProcessor:
                 # 현재 클래스의 최고 신뢰도 검출인지 확인
                 if class_name not in best_detections or score > best_detections[class_name]['score']:
                     # 박스 좌표
-                    box = outputs['det_boxes'][0][i]
-                    x1, y1, x2, y2 = box
-                    
-                    # 전처리 정보로 좌표 변환
-                    original_coords = image_service.convert_to_original_coordinates(
-                        [x1, y1, x2, y2], preprocess_info
-                    )
-                    x1, y1, x2, y2 = map(int, original_coords)
-                    
-                    # 중심점 계산
-                    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                    
-                    # 최고 신뢰도 검출 업데이트
-                    best_detections[class_name] = {
-                        'box': (x1, y1, x2, y2),
-                        'center': (cx, cy),
-                        'score': score
-                    }
+                    if 'det_boxes' in outputs and i < len(outputs['det_boxes'][0]):
+                        box = outputs['det_boxes'][0][i]
+                        x1, y1, x2, y2 = box
+                        
+                        # 전처리 정보로 좌표 변환
+                        original_coords = image_service.convert_to_original_coordinates(
+                            [x1, y1, x2, y2], preprocess_info
+                        )
+                        x1, y1, x2, y2 = map(int, original_coords)
+                        
+                        # 중심점 계산
+                        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                        
+                        # 최고 신뢰도 검출 업데이트
+                        best_detections[class_name] = {
+                            'box': (x1, y1, x2, y2),
+                            'center': (cx, cy),
+                            'score': score
+                        }
         
         # 최고 신뢰도 검출 결과를 points에 저장
-        for class_name, detection in best_detections.items():
+        for class_name, detection in best_detections.items() if 'best_detections' in locals() else []:
             points[class_name] = detection['center']
             
             # 시각화

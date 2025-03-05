@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 import sys
 from datetime import datetime
+import gc
 
 from core.config import USE_CUDA_STREAM
 from core.config import GAUGE_DETECT_MODEL_PATH as DEFAULT_MODEL_PATH
@@ -236,53 +237,39 @@ class TensorRTService:
         except Exception as e:
             logger.error(f"{self.model_name} 모델 웜업 중 오류 발생: {e}")
 
+    # trt_service.py에서 종료 처리 개선
     async def release(self) -> None:
         """TensorRT 서버 리소스를 안전하게 해제합니다."""
         if not self._initialized or self.trt_server is None:
-            logger.info(f"{self.model_name} 모델이 초기화되지 않았거나 이미 해제되었습니다.")
             return
         
         logger.info(f"{self.model_name}용 TensorRT 서버 리소스 해제 중...")
         
-        # 레지스트리에서 참조 카운트 감소
-        model_registry.unregister_model(self.registered_name)
-        ref_count = model_registry.get_ref_count(self.registered_name)
-        
-        # 참조 카운트가 0인 경우에만 실제로 리소스 해제
-        if ref_count <= 0:
-            logger.info(f"{self.model_name} 모델의 참조 카운트가 0이므로 실제로 리소스 해제 수행")
+        try:
+            # 모든 대기 중인 작업 완료 대기
+            pending_tasks = [task for task in asyncio.all_tasks() 
+                        if not task.done() and 'process_stream' in task.get_name()]
             
-            # 비동기 작업이 완료될 때까지 기다리기
+            if pending_tasks:
+                logger.info(f"{len(pending_tasks)}개의 대기 중인 작업 완료 대기...")
+                await asyncio.wait(pending_tasks, timeout=2.0)
+            
+            # 명시적 CUDA 동기화
             try:
-                # 활성 스트림 처리 작업 확인
-                pending_tasks = [task for task in asyncio.all_tasks() 
-                               if not task.done() and task.get_name().startswith('process_stream')]
-                
-                if pending_tasks:
-                    logger.info(f"{len(pending_tasks)}개의 대기 중인 스트림 처리 작업이 완료될 때까지 대기 중...")
-                    try:
-                        # 최대 3초 대기
-                        done, pending = await asyncio.wait(pending_tasks, timeout=3.0, return_when=asyncio.ALL_COMPLETED)
-                        if pending:
-                            logger.warning(f"타임아웃 후 {len(pending)}개 작업이 여전히 대기 중")
-                    except Exception as e:
-                        logger.error(f"작업 대기 중 오류: {e}")
+                import pycuda.driver as cuda
+                cuda.Context.synchronize()
             except Exception as e:
-                logger.error(f"대기 중인 작업 처리 중 오류: {e}")
+                logger.warning(f"CUDA 동기화 실패: {e}")
             
-            # 메모리 안전하게 해제
-            try:
-                logger.info(f"{self.model_name}에 대한 안전한 해제 메서드 호출")
-                self.trt_server.release(safe_exit=True)
-                self.trt_server = None
-            except Exception as e:
-                logger.error(f"{self.model_name} 서비스 해제 중 오류: {e}")
-                # 강제로 참조 제거
-                self.trt_server = None
+            # 서버 래퍼에 안전한 종료 신호 전달
+            self.trt_server.release(safe_exit=True)
+            self.trt_server = None
             
-            logger.info(f"{self.model_name}용 TensorRT 서버 리소스 해제됨")
-        else:
-            logger.info(f"{self.model_name} 모델의 참조 카운트가 {ref_count}이므로 실제 리소스 해제 생략")
+            # 최종 가비지 컬렉션 강제 실행
+            gc.collect()
+        except Exception as e:
+            logger.error(f"리소스 해제 중 오류: {e}")
+            self.trt_server = None
         
         self._initialized = False
     
@@ -786,6 +773,40 @@ async def lifespan_handler(app: FastAPI):
     yield  # 애플리케이션 실행 중
     
     # 종료 코드(리소스 해제)
-    logger.info("모든 TensorRT 서비스 종료 중...")
+    logger.info("애플리케이션 종료 - 모든 리소스 정리 시작...")
+    
+    # 1. 모든 스트림 비활성화 및 정리
+    try:
+        from api.endpoints.streaming import active_streams, clean_stream_resources
+        for stream_id in list(active_streams.keys()):
+            logger.info(f"스트림 '{stream_id}' 비활성화")
+            active_streams[stream_id] = False
+            clean_stream_resources(stream_id)
+        
+        # 스트림 서비스 정리
+        from services.stream_service import stream_service
+        stream_service.cleanup()
+    except Exception as e:
+        logger.error(f"스트림 정리 중 오류: {e}")
+    
+    # 2. 최대 0.5초 대기
+    await asyncio.sleep(0.5)
+    
+    # 3. 모든 모델 서비스 해제
     await model_manager.release_all()
+    
+    # 4. CUDA 컨텍스트 동기화 및 닫기
+    try:
+        import pycuda.driver as cuda
+        cuda.Context.synchronize()
+    except Exception as e:
+        logger.warning(f"CUDA 동기화 중 오류: {e}")
+    
+    # 5. 메모리 정리
+    trt_service = None
+    trt_services = {}
+    
+    import gc
+    gc.collect()
+    
     logger.info("모든 TensorRT 서비스가 해제되었습니다.")

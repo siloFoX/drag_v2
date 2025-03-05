@@ -181,6 +181,65 @@ class ImageService:
                 return True
         
         return False
+    
+    @staticmethod
+    def convert_to_original_coordinates(box_coords, preprocess_info):
+        """
+        모델 출력 좌표를 원본 이미지 좌표로 변환
+        
+        Args:
+            box_coords: 모델 출력 좌표 [x1, y1, x2, y2]
+            preprocess_info: 전처리 정보
+            
+        Returns:
+            원본 이미지 좌표 [x1, y1, x2, y2]
+        """
+        # 입력 좌표 형태 확인
+        if len(box_coords) != 4:
+            raise ValueError("좌표는 [x1, y1, x2, y2] 형태여야 합니다")
+        
+        x1, y1, x2, y2 = box_coords
+        
+        # 전처리 정보에서 관련 값 추출
+        ratio = preprocess_info['ratio']
+        new_width = preprocess_info['new_width']
+        new_height = preprocess_info['new_height']
+        original_width = preprocess_info['original_width']
+        original_height = preprocess_info['original_height']
+        
+        # 좌표가 정규화되었는지 확인 (0~1 범위)
+        is_normalized = all(0 <= coord <= 1.0 for coord in [x1, y1, x2, y2])
+        
+        # 좌표 변환
+        if is_normalized:
+            # 정규화된 좌표를 모델 입력 크기로 변환
+            x1_model = x1 * preprocess_info['target_width']
+            y1_model = y1 * preprocess_info['target_height']
+            x2_model = x2 * preprocess_info['target_width']
+            y2_model = y2 * preprocess_info['target_height']
+        else:
+            # 이미 픽셀 단위인 경우 그대로 사용
+            x1_model, y1_model, x2_model, y2_model = x1, y1, x2, y2
+        
+        # 패딩된 영역 내에 좌표가 있는지 확인
+        x1_model = min(max(x1_model, 0), new_width)
+        y1_model = min(max(y1_model, 0), new_height)
+        x2_model = min(max(x2_model, 0), new_width)
+        y2_model = min(max(y2_model, 0), new_height)
+        
+        # 모델 좌표를 원본 이미지 좌표로 변환
+        x1_orig = x1_model / ratio
+        y1_orig = y1_model / ratio
+        x2_orig = x2_model / ratio
+        y2_orig = y2_model / ratio
+        
+        # 원본 이미지 범위 내 확인
+        x1_orig = max(0, min(x1_orig, original_width))
+        y1_orig = max(0, min(y1_orig, original_height))
+        x2_orig = max(0, min(x2_orig, original_width))
+        y2_orig = max(0, min(y2_orig, original_height))
+        
+        return [x1_orig, y1_orig, x2_orig, y2_orig]
 
 # Create a singleton instance
 image_service = ImageService()
