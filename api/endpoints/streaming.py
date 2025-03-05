@@ -126,7 +126,7 @@ async def video_feed(stream_id: str):
 
 async def process_frame(frame):
     """Process a single frame with the object detection model."""
-    trt_service = trt_services.get("gauge_detection")
+    trt_service = trt_services.get("gauge_detect")
     if frame is None or not trt_service.is_initialized():
         return frame
     
