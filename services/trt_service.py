@@ -628,97 +628,33 @@ async def initialize_models(model_manager: TensorRTModelManager, models_config: 
     """
     logger.info("모든 TensorRT 모델 순차적으로 초기화 중...")
     
-    success = True
-    core_models_success = True
-    
-    # 핵심 모델(처음에 반드시 초기화되어야 하는 모델) 목록
-    core_models = ["gauge_detect", "gauge_feature"]
-    
-    # 핵심 모델 먼저 처리
-    for name in core_models:
-        if name not in models_config:
-            logger.warning(f"핵심 모델 '{name}'이(가) 모델 구성에 없습니다")
-            core_models_success = False
-            continue
-            
-        path = models_config[name]
-        if not os.path.exists(path):
-            logger.error(f"핵심 모델 파일을 찾을 수 없음: {path}")
-            core_models_success = False
-            continue
-        
-        # 이미 초기화된 모델이면 건너뛰기
-        if name in model_manager.services and model_manager.services[name].is_initialized():
-            logger.info(f"핵심 모델 '{name}'이(가) 이미 초기화되어 있습니다")
-            continue
-            
-        # 순차적으로 초기화
-        logger.info(f"핵심 모델 '{name}' 초기화 중...")
-        try:
-            service = TensorRTService(path, enable_metrics=True, model_name=name)
-            model_manager.services[name] = service
-            
-            # 동기적으로 초기화 - 한 번에 하나의 모델만 초기화하도록
-            result = service.initialize()
-            
-            if not result:
-                logger.error(f"핵심 모델 '{name}' 초기화 실패")
-                core_models_success = False
-            else:
-                logger.info(f"핵심 모델 '{name}' 초기화 성공")
-        except Exception as e:
-            logger.error(f"핵심 모델 '{name}' 초기화 중 오류: {e}")
-            core_models_success = False
-    
-    # 핵심 모델 초기화 실패 시 다른 모델은 초기화하지 않음
-    if not core_models_success:
-        logger.error("핵심 모델 초기화 실패. 다른 모델 초기화 건너뜀")
-        return False
-        
-    # 나머지 모델 처리 (핵심 모델이 아닌 모델)
+    # 각 모델을 하나씩 순차적으로 초기화
     for name, path in models_config.items():
-        # 핵심 모델이면 건너뛰기 (이미 처리됨)
-        if name in core_models:
-            continue
-            
-        # 모델 파일 존재 확인
-        if not os.path.exists(path):
-            logger.error(f"모델 파일을 찾을 수 없음: {path}")
-            success = False
-            continue
-            
         # 이미 초기화된 모델이면 건너뛰기
         if name in model_manager.services and model_manager.services[name].is_initialized():
             logger.info(f"모델 '{name}'이(가) 이미 초기화되어 있습니다")
             continue
             
-        # 순차적으로 초기화
+        # 한 번에 하나의 모델만 로드하여 CUDA 컨텍스트 충돌 방지
+        logger.info(f"모델 '{name}' 초기화 중...")
         try:
-            service = TensorRTService(path, enable_metrics=True, model_name=name)
-            model_manager.services[name] = service
-            
-            # 동기적으로 초기화
-            result = service.initialize()
-            
-            if not result:
-                logger.error(f"모델 '{name}' 초기화 실패")
-                success = False
-            else:
+            success = model_manager.register_model(name, path)
+            if success:
                 logger.info(f"모델 '{name}' 초기화 성공")
+            else:
+                logger.error(f"모델 '{name}' 초기화 실패")
         except Exception as e:
             logger.error(f"모델 '{name}' 초기화 중 오류: {e}")
-            success = False
+        
+        # 각 모델 초기화 사이에 짧은 지연
+        await asyncio.sleep(0.5)
     
-    # 초기화 결과 로깅
-    initialized_models = [name for name, service in model_manager.services.items() if service.is_initialized()]
+    # 초기화 결과 확인
+    initialized_models = [name for name, service in model_manager.services.items() 
+                         if service.is_initialized()]
     logger.info(f"초기화된 모델: {initialized_models}")
     
-    failed_models = [name for name, service in model_manager.services.items() if not service.is_initialized()]
-    if failed_models:
-        logger.warning(f"초기화 실패한 모델: {failed_models}")
-    
-    # 핵심 모델이 성공적으로 초기화되었으면 전체 결과와 상관없이 True 반환
-    return core_models_success
+    return len(initialized_models) > 0
 
 # 모델 관리자 생성
 model_manager = TensorRTModelManager()

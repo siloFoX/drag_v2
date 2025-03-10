@@ -432,6 +432,17 @@ class TRTServerWithMemoryPool:
         if times:
             avg_time = sum(times) / len(times)
             logger.info(f"웜업 완료. 평균 실행 시간: {avg_time:.2f}ms")
+
+    def _reset_memory_pool(self):
+        """메모리 풀 재설정 - 오류 발생 시 호출"""
+        if hasattr(self, 'memory_pool') and self.memory_pool:
+            try:
+                self.memory_pool.release()
+                # 메모리 풀 다시 초기화
+                self.memory_pool = TRTMemoryPool(self.binding_shapes, self.binding_dtypes)
+                logger.info("메모리 풀 재설정 완료")
+            except Exception as e:
+                logger.error(f"메모리 풀 재설정 중 오류: {e}")
     
     def release(self):
         """리소스 해제 - CUDA 컨텍스트 관리 강화"""

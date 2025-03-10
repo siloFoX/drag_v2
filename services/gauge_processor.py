@@ -5,6 +5,7 @@ drag_v2/services/gauge_processor.py
 import cv2
 import numpy as np
 from typing import List, Dict, Any
+import gc
 
 from core.logging import logger
 from core.exceptions import ProcessingError
@@ -131,6 +132,9 @@ class GaugeProcessor:
                 if "cuda" in error_str or "resource handle" in error_str:
                     cuda_error_occurred = True
                     logger.error(f"CUDA 오류 발생: {e}, 감지 단계 건너뛰기")
+
+                    gc.collect()  # 가비지 컬렉션 실행
+
                     # CUDA 에러 시 빈 결과로 계속 진행
                     result["message"] = "CUDA 리소스 오류, 감지 단계 건너뛰기"
                     return self._finalize_result(result, start_time)

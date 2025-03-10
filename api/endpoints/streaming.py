@@ -16,10 +16,12 @@ from utils.visualization import visualization_utils
 from models.requests import StreamRequest
 from models.responses import StreamInfo
 
+import numpy as np
 import threading
 import asyncio
 import cv2
 import time
+import gc
 
 # 전역 처리 동기화를 위한 락 추가 (파일 상단에 추가)
 global_processing_lock = threading.Lock()
@@ -403,8 +405,26 @@ async def process_frame(frame, stream_id):
         return processed_frame
         
     except Exception as e:
-        logger.error(f"[Stream {stream_id}] 프레임 처리 중 오류: {e}")
-        return frame
+        # CUDA 오류 특별 처리
+        error_str = str(e).lower()
+        if "cuda" in error_str or "resource handle" in error_str:
+            logger.error(f"프레임 처리 중 CUDA 오류: {e}")
+            # 오류 메시지를 프레임에 표시
+            error_frame = frame.copy() if frame is not None else np.zeros((480, 640, 3), dtype=np.uint8)
+            cv2.putText(
+                error_frame,
+                "CUDA 리소스 오류 발생, 복구 중...",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7, (0, 0, 255), 2
+            )
+            # 가비지 컬렉션 실행
+            gc.collect()
+            return error_frame
+        else:
+            # 기타 오류는 기존대로 처리
+            logger.error(f"프레임 처리 중 오류: {e}")
+            return frame
     
     finally:
         # 항상 락 해제

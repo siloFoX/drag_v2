@@ -159,20 +159,33 @@ class SafeTRTServerWrapper:
         """
         if not self._initialized or self.trt_server is None:
             raise RuntimeError("TensorRT 서버가 초기화되지 않았습니다")
-            
-        # 리소스 락을 사용하지 않고 추론만 실행
-        # 추론 자체는 TensorRT 내부에서 동기화됨
-        result = self.trt_server.predict(input_data)
         
-        # 추론 횟수 업데이트
-        with self.resources_lock:
-            self._prediction_count += 1
+        try:
+            # 리소스 락을 사용하지 않고 추론만 실행
+            # 추론 자체는 TensorRT 내부에서 동기화됨
+            result = self.trt_server.predict(input_data)
             
-            # 안정성을 위해 1000회 추론마다 가비지 컬렉션 실행
-            if self._prediction_count % 1000 == 0:
-                gc.collect()
-        
-        return result
+            # 추론 횟수 업데이트
+            with self.resources_lock:
+                self._prediction_count += 1
+                
+                # 안정성을 위해 1000회 추론마다 가비지 컬렉션 실행
+                if self._prediction_count % 1000 == 0:
+                    gc.collect()
+            
+            return result
+        except Exception as e:
+            # CUDA 오류 처리 추가
+            error_str = str(e).lower()
+            if "cuda" in error_str or "resource handle" in error_str:
+                logger.error(f"CUDA 리소스 오류 발생: {e}")
+                # 리소스 정리 시도
+                self.trt_server.release(safe_exit=False)
+                # 서버 재초기화
+                self.initialize()
+                # 빈 결과 반환
+                return {}, 0.0
+            raise
     
     def check_engine(self) -> bool:
         """엔진 유효성 확인"""
